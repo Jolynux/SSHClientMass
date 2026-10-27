@@ -391,10 +391,6 @@ def ssh_execution(username, password, host, port, command, os_type="auto"):
     }
 
     ssh = paramiko.SSHClient()
-
-    # À privilégier en production : les clés doivent être connues
-    # et vérifiées dans ~/.ssh/known_hosts.
-    ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     start_time = time.monotonic()
