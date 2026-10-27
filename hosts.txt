@@ -1,8 +1,22 @@
-# Port global facultatif
-PORT=8222
+# hosts.txt
 
-# Hôtes
-VM1
-VM2:2222
-VM3:3456
-192.168.1.50
+# Valeurs globales
+PORT=22
+OS=auto
+
+# Hôtes classiques
+linux01
+mac01
+windows01;os=windows
+
+# Ports personnalisés
+linux02:2222
+windows02:8222;os=windows
+
+# Équipements réseau : type explicite conseillé
+switch01;os=cisco_ios
+routeur01;os=junos;port=2222
+firewall01;os=fortios
+
+# Autre équipement
+equipement01;os=auto;port=2200
