@@ -1,6 +1,7 @@
 
 import getpass
 import time
+import socket
 from datetime import datetime
 from pathlib import Path
 
@@ -21,71 +22,145 @@ REPORT_DIR = Path("reports")
 COMMAND_TIMEOUT = 60
 CONNECT_TIMEOUT = 10
 DEFAULT_SSH_PORT = 22
+DEFAULT_OS = "auto"
+
+# Types pris en charge
+SUPPORTED_OS = {
+    "auto",
+    "linux",
+    "windows",
+    "macos",
+    "shell",
+    "network",
+    "cisco_ios",
+    "junos",
+    "fortios",
+}
 
 
 def load_hosts(filename):
-    """Charge les hôtes et leurs ports depuis un fichier texte.
+    """Charge les hôtes, les ports et les types depuis l'inventaire.
 
     Formats acceptés :
         VM1
         PORT=8222
+        OS=windows
         VM2:2222
-
-    Le port par défaut est 22.
-    Un port spécifique à un hôte est prioritaire sur le port global.
+        VM3;os=linux;port=2200
+        SWITCH1;os=cisco_ios
     """
 
     default_port = DEFAULT_SSH_PORT
+    default_os = DEFAULT_OS
     hosts = []
 
     with open(filename, "r", encoding="utf-8") as file:
         lines = [
             line.strip()
             for line in file
-            if line.strip() and not line.lstrip().startswith("#")
+            if line.strip()
+            and not line.lstrip().startswith("#")
         ]
 
-    # Lecture du port global.
+    # Paramètres globaux
     for line in lines:
-        if line.upper().startswith("PORT="):
-            port_str = line.split("=", 1)[1].strip()
+        key, separator, value = line.partition("=")
 
+        if not separator:
+            continue
+
+        key = key.strip().upper()
+        value = value.strip()
+
+        if key == "PORT":
             try:
-                default_port = int(port_str)
-            except ValueError:
+                default_port = int(value)
+            except ValueError as exc:
                 raise ValueError(
-                    f"Port global invalide dans l'inventaire : {line}"
-                )
+                    f"Port global invalide : {line}"
+                ) from exc
 
             if not 1 <= default_port <= 65535:
                 raise ValueError(
                     f"Port global hors limites : {default_port}"
                 )
 
-    # Lecture des hôtes.
+        elif key == "OS":
+            default_os = value.lower()
+
+            if default_os not in SUPPORTED_OS:
+                raise ValueError(
+                    f"Type global non pris en charge : {value}"
+                )
+
+    # Entrées des hôtes
     for line in lines:
-        if line.upper().startswith("PORT="):
+        key, separator, _ = line.partition("=")
+
+        if separator and key.strip().upper() in {"PORT", "OS"}:
             continue
 
-        if ":" in line:
-            host, port_str = line.rsplit(":", 1)
+        parts = [part.strip() for part in line.split(";")]
+        address = parts[0]
 
-            try:
-                port = int(port_str)
-            except ValueError:
+        if not address:
+            raise ValueError(
+                f"Nom d'hôte vide : {line}"
+            )
+
+        host = address
+        port = default_port
+        os_type = default_os
+
+        # Compatibilité avec l'ancien format HOST:PORT.
+        # Pour IPv6, utiliser HOST;port=PORT.
+        if ":" in address:
+            candidate_host, candidate_port = address.rsplit(":", 1)
+
+            if candidate_port.isdigit():
+                host = candidate_host.strip()
+                port = int(candidate_port)
+
+        # Paramètres spécifiques à l'hôte
+        for option in parts[1:]:
+            if not option:
+                continue
+
+            key, separator, value = option.partition("=")
+
+            if not separator:
                 raise ValueError(
-                    f"Port invalide dans l'entrée : {line}"
+                    f"Option invalide dans l'entrée : {option}"
                 )
 
-            if not 1 <= port <= 65535:
-                raise ValueError(
-                    f"Port hors limites dans l'entrée : {line}"
-                )
-        else:
-            host = line
-            port = default_port
+            key = key.strip().lower()
+            value = value.strip()
 
-        host = host.strip()
+            if key == "port":
+                try:
+                    port = int(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Port invalide dans l'entrée : {line}"
+                    ) from exc
+
+            elif key == "os":
+                os_type = value.lower()
+
+            else:
+                raise ValueError(
+                    f"Option inconnue '{key}' dans : {line}"
+                )
+
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                f"Port hors limites dans l'entrée : {line}"
+            )
+
+        if os_type not in SUPPORTED_OS:
+            raise ValueError(
+                f"Type d'hôte non pris en charge : {os_type}"
+            )
 
         if not host:
             raise ValueError(
@@ -95,17 +170,219 @@ def load_hosts(filename):
         hosts.append({
             "host": host,
             "port": port,
+            "os": os_type,
         })
 
     return hosts
 
 
-def ssh_execution(username, password, host, port, command):
-    """Exécute une commande SSH et retourne un résultat structuré."""
+def detect_os(ssh):
+    """Détecte Linux, macOS ou Windows lorsque c'est possible.
+
+    Retourne 'unknown' si le shell ne permet pas de conclure.
+    """
+
+    probes = [
+        (
+            "uname -s",
+            lambda output: (
+                "macos"
+                if "darwin" in output.lower()
+                else "linux"
+                if "linux" in output.lower()
+                else None
+            ),
+        ),
+        (
+            "cmd.exe /c ver",
+            lambda output: (
+                "windows"
+                if "windows" in output.lower()
+                else None
+            ),
+        ),
+    ]
+
+    for command, identify in probes:
+        try:
+            stdin, stdout, stderr = ssh.exec_command(
+                command,
+                timeout=5,
+                get_pty=False,
+            )
+
+            channel = stdout.channel
+
+            # Attendre une réponse, sans bloquer indéfiniment.
+            deadline = time.monotonic() + 5
+
+            while (
+                not channel.exit_status_ready()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.1)
+
+            if not channel.exit_status_ready():
+                channel.close()
+                continue
+
+            output = stdout.read().decode(
+                "utf-8", errors="replace"
+            )
+
+            detected = identify(output)
+
+            if detected:
+                return detected
+
+        except (SSHException, OSError, TimeoutError):
+            continue
+
+    return "unknown"
+
+
+
+NETWORK_TYPES = {
+    "network",
+    "cisco_ios",
+    "junos",
+    "fortios",
+}
+
+
+def execute_shell(ssh, command):
+    """Exécute une commande via le canal SSH non interactif."""
+
+    stdin, stdout, stderr = ssh.exec_command(
+        command,
+        timeout=COMMAND_TIMEOUT,
+        get_pty=False,
+    )
+
+    stdin.close()
+    channel = stdout.channel
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+
+    output = bytearray()
+    errors = bytearray()
+
+    while True:
+        received_data = False
+
+        while channel.recv_ready():
+            output.extend(channel.recv(65536))
+            received_data = True
+
+        while channel.recv_stderr_ready():
+            errors.extend(channel.recv_stderr(65536))
+            received_data = True
+
+        if channel.exit_status_ready():
+            # Lire les dernières données disponibles.
+            while channel.recv_ready():
+                output.extend(channel.recv(65536))
+
+            while channel.recv_stderr_ready():
+                errors.extend(channel.recv_stderr(65536))
+
+            break
+
+        if time.monotonic() >= deadline:
+            channel.close()
+            raise TimeoutError(
+                f"La commande a dépassé {COMMAND_TIMEOUT} secondes"
+            )
+
+        if not received_data:
+            time.sleep(0.05)
+
+    exit_code = channel.recv_exit_status()
+
+    return (
+        output.decode("utf-8", errors="replace").strip(),
+        errors.decode("utf-8", errors="replace").strip(),
+        exit_code,
+    )
+
+
+def execute_network_cli(ssh, command):
+    """Exécute une commande dans une CLI interactive.
+
+    Le code retour est généralement indisponible de façon
+    portable sur les équipements réseau.
+    """
+
+    channel = ssh.invoke_shell(
+        term="vt100",
+        width=200,
+        height=1000,
+    )
+
+    channel.settimeout(0.2)
+
+    # Consommer la bannière et l'invite initiale.
+    initial_deadline = time.monotonic() + 2
+
+    while time.monotonic() < initial_deadline:
+        try:
+            if channel.recv_ready():
+                channel.recv(65536)
+            else:
+                time.sleep(0.05)
+        except (socket.timeout, TimeoutError):
+            break
+
+    channel.send(command + "\n")
+
+    output = bytearray()
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+    last_data_time = time.monotonic()
+    idle_timeout = 1.5
+
+    try:
+        while time.monotonic() < deadline:
+            try:
+                if channel.recv_ready():
+                    chunk = channel.recv(65536)
+
+                    if not chunk:
+                        break
+
+                    output.extend(chunk)
+                    last_data_time = time.monotonic()
+
+                elif time.monotonic() - last_data_time >= idle_timeout:
+                    break
+
+                else:
+                    time.sleep(0.05)
+
+            except (socket.timeout, TimeoutError):
+                if time.monotonic() - last_data_time >= idle_timeout:
+                    break
+
+    finally:
+        channel.close()
+
+    if time.monotonic() >= deadline:
+        raise TimeoutError(
+            f"La CLI est restée active plus de {COMMAND_TIMEOUT} secondes"
+        )
+
+    return (
+        output.decode("utf-8", errors="replace").strip(),
+        "",
+        None,
+    )
+
+
+def ssh_execution(username, password, host, port, command, os_type="auto"):
+    """Exécute une commande SSH avec sélection du mode d'exécution."""
 
     result = {
         "Hote": host,
         "Port": port,
+        "OS": os_type,
         "Statut": "ERREUR",
         "Code retour": None,
         "Duree (s)": 0,
@@ -114,7 +391,10 @@ def ssh_execution(username, password, host, port, command):
     }
 
     ssh = paramiko.SSHClient()
-    
+
+    # À privilégier en production : les clés doivent être connues
+    # et vérifiées dans ~/.ssh/known_hosts.
+    ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     start_time = time.monotonic()
@@ -134,30 +414,35 @@ def ssh_execution(username, password, host, port, command):
             allow_agent=False,
         )
 
-        stdin, stdout, stderr = ssh.exec_command(
-            command,
-            timeout=COMMAND_TIMEOUT,
-            get_pty=True,
-        )
+        effective_os = os_type.lower()
 
-        # Ferme l'entrée standard pour les commandes non interactives.
-        stdin.close()
+        if effective_os == "auto":
+            effective_os = detect_os(ssh)
 
-        # Récupération des sorties.
-        result["Sortie standard"] = stdout.read().decode(
-            "utf-8", errors="replace"
-        ).strip()
+        result["OS"] = effective_os
 
-        result["Erreur standard"] = stderr.read().decode(
-            "utf-8", errors="replace"
-        ).strip()
+        if effective_os in NETWORK_TYPES:
+            stdout_text, stderr_text, exit_code = (
+                execute_network_cli(ssh, command)
+            )
+        else:
+            # linux, macos, windows, shell ou unknown :
+            # utiliser le shell configuré sur le serveur SSH.
+            stdout_text, stderr_text, exit_code = (
+                execute_shell(ssh, command)
+            )
 
-        # Récupération du code retour.
-        result["Code retour"] = stdout.channel.recv_exit_status()
+        result["Sortie standard"] = stdout_text
+        result["Erreur standard"] = stderr_text
+        result["Code retour"] = exit_code
 
-        result["Statut"] = (
-            "OK" if result["Code retour"] == 0 else "ECHEC"
-        )
+        if exit_code is None:
+            # La CLI réseau ne fournit pas de code portable.
+            result["Statut"] = "OK" if stdout_text else "INDETERMINE"
+        else:
+            result["Statut"] = (
+                "OK" if exit_code == 0 else "ECHEC"
+            )
 
     except AuthenticationException:
         result["Erreur standard"] = (
@@ -166,18 +451,18 @@ def ssh_execution(username, password, host, port, command):
 
     except BadHostKeyException:
         result["Erreur standard"] = (
-            "La clé SSH du serveur a changé"
+            "La clé SSH du serveur ne correspond pas "
+            "à celle enregistrée"
         )
 
     except NoValidConnectionsError as exc:
-        result["Erreur standard"] = (
-            f"Connexion impossible : {exc}"
-        )
+        result["Erreur standard"] = f"Connexion impossible : {exc}"
 
-    except (TimeoutError, OSError) as exc:
-        result["Erreur standard"] = (
-            f"Erreur réseau ou timeout : {exc}"
-        )
+    except (TimeoutError, socket.timeout) as exc:
+        result["Erreur standard"] = f"Timeout : {exc}"
+
+    except OSError as exc:
+        result["Erreur standard"] = f"Erreur réseau : {exc}"
 
     except SSHException as exc:
         result["Erreur standard"] = f"Erreur SSH : {exc}"
@@ -189,12 +474,14 @@ def ssh_execution(username, password, host, port, command):
 
     finally:
         ssh.close()
+
         result["Duree (s)"] = round(
             time.monotonic() - start_time, 2
         )
 
     print(
         f"[{result['Statut']}] {host}:{port} "
+        f"OS={result['OS']} "
         f"(code={result['Code retour']}, "
         f"{result['Duree (s)']} s)"
     )
@@ -234,6 +521,7 @@ def generate_reports(results, command):
         for result in results:
             file.write(f"HOTE : {result['Hote']}\n")
             file.write(f"PORT SSH : {result['Port']}\n")
+            file.write(f"TYPE OS : {result['OS']}\n")
             file.write(f"STATUT : {result['Statut']}\n")
             file.write(
                 f"CODE RETOUR : {result['Code retour']}\n"
@@ -350,6 +638,7 @@ def launcher():
             host=entry["host"],
             port=entry["port"],
             command=command,
+            os_type=entry["os"],
         )
 
         results.append(result)
